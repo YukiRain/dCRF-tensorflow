@@ -4,13 +4,6 @@ from tensorflow.contrib import slim
 import math
 import pydensecrf.densecrf as dcrf
 
-_kernel_init = np.array([[1,2,3,2,1],
-                         [2,5,6,5,2],
-                         [3,6,8,6,3],
-                         [2,5,6,5,2],
-                         [1,2,3,2,1]]).astype(np.float32)
-_kernel_gaussian = _kernel_init / float(_kernel_init.sum())
-
 
 def batch_norm(input_op, is_training, epsilon=1e-5, momentum=0.99, name='batch_norm'):
     return tf.contrib.layers.batch_norm(input_op, decay=momentum, updates_collections=None,
@@ -158,8 +151,23 @@ def get_message_kernels(theta=5.0, abstract=True):
             output.append(kernel)
     return output
 
+def get_big_message_kernels(theta=5.0, abstract=True):
+    output = list()
+    for i in range(9):
+        for j in range(9):
+            if i == 4 and j == 4:
+                continue
+            kernel = np.zeros((9, 9), dtype=np.float32)
+            kernel[i, j] = 1.0
+            if abstract:
+                kernel[4, 4] = -1.0
+                d = ((i - 4)**2 + (j - 4)**2) / theta
+                kernel *= math.exp(-d)
+            output.append(kernel)
+    return output
+
 def message_passing(img_op, Q_i, Q_j, name='message_passing', theta=10.0,
-                    alpha=10.0, beta=5.0, reuse=False, has_variables=False):
+                    alpha=10.0, beta=0.1, reuse=False, has_variables=False):
     # Q_i must be one channel for axis==3
     n_in = img_op.get_shape()[-1].value
     n_in_ = Q_j.get_shape()[-1].value
@@ -193,7 +201,7 @@ def message_passing(img_op, Q_i, Q_j, name='message_passing', theta=10.0,
             output = tf.log(probs + 1e-10) - tf.nn.conv2d(concat, k_out, (1, 1, 1, 1), padding='SAME')
         else:
             psi_i = tf.log(Q_i + 1e-10) - alpha * appearance_i - beta * smooth_i
-            psi_j = tf.log(Q_j + 1e-10) - appearance_j - smooth_j
+            psi_j = tf.log(Q_j + 1e-10) - alpha * appearance_j - beta * smooth_j
             output = tf.concat([psi_j, psi_i], axis=3, name='concat')
         return tf.nn.softmax(output, axis=3, name='softmax')
 
@@ -205,16 +213,16 @@ def const_conv2d(input_op, ink, n_out, name, dh=1, dw=1):
         kernel = tf.constant(kernel_, dtype=tf.float32, name='const_kernel')
         return tf.nn.conv2d(input_op, kernel, (1, dh, dw, 1), padding='SAME')
 
-def message_passing_v2(img_op, Q_i, Q_j, name='message_passing',
-                       theta=10.0, reuse=False, has_variables=False):
+def message_passing_v2(img_op, Q_i, Q_j, name='message_passing', theta=20.0,
+                    alpha=2.0, beta=0.2, reuse=False, has_variables=False):
     # Q_i must be one channel for axis==3
     n_in = img_op.get_shape()[-1].value
     n_in_ = Q_j.get_shape()[-1].value
 
     kernel_ = np.array(get_message_kernels(theta), dtype=np.float32)
-    kernel_ = np.array([kernel_ for _ in range(n_in)], dtype=np.float32).transpose((2, 3, 0, 1))
+    kernel_ = np.array([kernel_ for _ in range(n_in)], dtype=np.float32).transpose((2,3,0,1))
     _kernel = np.array([get_message_kernels(abstract=False)], dtype=np.float32)
-    _kernel = np.concatenate([_kernel for _ in range(n_in_)], axis=0).transpose((2, 3, 0, 1))
+    _kernel = np.concatenate([_kernel for _ in range(n_in_)], axis=0).transpose((2,3,0,1))
 
     with tf.variable_scope(name, reuse=reuse):
         p_kernel = tf.constant(kernel_, dtype=tf.float32, name='p_kernel')
@@ -232,17 +240,24 @@ def message_passing_v2(img_op, Q_i, Q_j, name='message_passing',
         smooth_j = const_conv2d(Q_i, ink=gaussian_5x5, n_out=1, name='smooth_j') * Q_j
 
         # non-parametric is also implement here for the convenience of testing
-        psi_i = tf.log(Q_i + 1e-10) - appearance_i - smooth_i
-        psi_j = tf.log(Q_j + 1e-10) - appearance_j - smooth_j
-        return psi_i, psi_j
-
+        if has_variables:
+            probs = tf.concat([Q_j, Q_i], axis=3, name='probs')
+            concat = tf.concat([appearance_i, smooth_i, appearance_j, smooth_j], axis=3, name='concat')
+            k_out = tf.get_variable('kernel_i', shape=(1, 1, 4, 2), dtype=tf.float32,
+                                    initializer=tf.constant_initializer(1.0))
+            output = tf.log(probs + 1e-10) - tf.nn.conv2d(concat, k_out, (1, 1, 1, 1), padding='SAME')
+        else:
+            psi_i = tf.log(Q_i + 1e-10) - 15.0 * appearance_i - 2.0 * smooth_i
+            psi_j = tf.log(Q_j + 1e-10) - 2.0 * appearance_j - 2.0 * smooth_j
+            output = tf.concat([psi_j, psi_i], axis=3, name='concat')
+        return tf.nn.softmax(output, axis=3, name='softmax')
 
 # The idea is borrowed from https://github.com/DrSleep/tensorflow-deeplab-resnet/tree/crf
-def dense_crf(probs, img=None, n_iters=10, n_classes=2,
-              sxy_gaussian=(1, 1), compat_gaussian=4,
+def dense_crf(probs, img=None, n_iters=5, n_classes=2,
+              sxy_gaussian=(1, 1), compat_gaussian=1,
               kernel_gaussian=dcrf.DIAG_KERNEL,
               normalisation_gaussian=dcrf.NORMALIZE_SYMMETRIC,
-              sxy_bilateral=(49, 49), compat_bilateral=5,
+              sxy_bilateral=(49, 49), compat_bilateral=3,
               srgb_bilateral=(13, 13, 13),
               kernel_bilateral=dcrf.DIAG_KERNEL,
               normalisation_bilateral=dcrf.NORMALIZE_SYMMETRIC):
@@ -284,7 +299,7 @@ def dense_crf(probs, img=None, n_iters=10, n_classes=2,
     return np.expand_dims(preds, 0)
 
 '''
-    以下attention内容，复现CVPR2017: Looking Closer to See Better
-    原始论文是用于做classification的，这里是做segmentation的refinement
-    原始论文用spatial transform layer训练，这里用policy gradient训练；但都是hard attention，使用方法相同
+    以下内容复现论文ICLR2018: Certifiable Distributional Robustness with Principled Adversarial Training
+    核心的内容是生成adversarial examples给FCN训练，生成的样本分布与原始样本分布的Wasserstein distance不大于一个常数gamma
+    假设神经网络的capacity无限，则神经网络总可以同时包含原始样本与这些adversarial examples
 '''

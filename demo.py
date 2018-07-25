@@ -24,7 +24,7 @@ if has_variable:
 img_op = tf.placeholder(tf.float32, shape=[1, 512, 512, 1], name='img_op')
 q_i = tf.placeholder(tf.float32, shape=[1, 512, 512, 1], name='q_i')
 q_j = tf.placeholder(tf.float32, shape=[1, 512, 512, 1], name='q_j')
-crf = utils.message_passing(img_op, q_i, q_j, has_variables=has_variable)
+crf = utils.message_passing_v2(img_op, q_i, q_j, has_variables=has_variable)
 
 if has_variable:
     label_op = tf.placeholder(tf.float32, shape=[1, 512, 512, 2], name='label_op')
@@ -39,12 +39,12 @@ with tf.Session() as sess:
 
     if has_variable:
         print('----------------TRAINING----------------')
-        for i in range(3000):
+        for i in range(300):
             sess.run(optim, feed_dict={img_op: img, q_i: mask, q_j: arg_mask, label_op: label})
     print('----------------TESTING-----------------')
     out = sess.run(crf, feed_dict={img_op: img, q_i: mask, q_j: arg_mask})
 
-    for _ in range(30):
+    for _ in range(50):
         tq_i = np.expand_dims(out[:, :, :, 0], axis=3)
         tq_j = np.expand_dims(out[:, :, :, 1], axis=3)
         out = sess.run(crf, feed_dict={img_op: img, q_i: tq_i, q_j: tq_j})

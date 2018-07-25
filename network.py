@@ -1,10 +1,9 @@
 from datetime import datetime
-import matplotlib.pyplot as plt
 from functools import reduce
 import os
 
 from utils import *
-from cnn_read import Reader, queueReader
+from cnn_read import Reader, queueReader, testReader
 
 
 class CRF_RNN(object):
@@ -59,7 +58,7 @@ class CRF_RNN(object):
         image_reshaped = tf.reshape(image_resized, shape=[512, 512, 2])
         image_flip = tf.image.random_flip_up_down(tf.image.random_flip_left_right(image_reshaped))
         sub_img, sub_label = tf.split(image_flip, num_or_size_splits=[1, 1], axis=2)
-        self.sub_img = tf.expand_dims(tf.image.random_contrast(sub_img, 0.2, 0.9), dim=0)
+        self.sub_img = tf.expand_dims(tf.image.random_contrast(sub_img, 0.1, 0.9), dim=0)
         self.sub_label = tf.cast(tf.expand_dims(sub_label, dim=0), tf.int32)
 
         self.random_image = tf.reshape(tf.image.random_contrast(self.input_image, 0.2, 1.0),
@@ -67,6 +66,7 @@ class CRF_RNN(object):
 
         self.fcnn, self.fcnn_logits = self._build_fcn(self.input_image, is_training=True, reuse=False)
         self.sub_fcnn, self.sub_logits = self._build_fcn(self.sub_img, is_training=True, reuse=True)
+        self.crf = self._build_crf(self.fcnn, self.input_image, self.fcnn_logits)
 
         trainable_variables = tf.trainable_variables()
         self.fcn_vars = [var for var in trainable_variables if 'FCNN' in var.name]
@@ -103,13 +103,46 @@ class CRF_RNN(object):
             conv5_3 = conv2d(conv5_2, n_out=2, name='conv5_3')
             return tf.nn.softmax(conv5_3, axis=3, name='softmax'), conv5_3
 
-    def _build_crf(self, input_op, unaries):
-        # The implementation performs a simplification of CRFasRNN in binary classification
+    @staticmethod
+    def _build_crf(q_op, img_op, unaries=None, theta=10.0, has_variables=False):
         with tf.variable_scope('CRF'):
-            q_i, q_j = tf.split(input_op, [1, 1], axis=3)
-            psi_i, psi_j = message_passing_v2(self.input_image * 255.0, q_i, q_j)
-            psi = tf.concat([psi_j, psi_i], axis=3, name='psi')
+            Q_j, Q_i = tf.split(q_op, [1, 1], axis=3)
+            # unary_j, unary_i = tf.split(unaries, [1, 1], axis=3)
+            # Q_i must be one channel for axis==3
+            n_in = img_op.get_shape()[-1].value
+            n_in_ = Q_j.get_shape()[-1].value
 
+            kernel_ = np.array(get_message_kernels(theta), dtype=np.float32)
+            kernel_ = np.array([kernel_ for _ in range(n_in)], dtype=np.float32).transpose((2, 3, 0, 1))
+            _kernel = np.array([get_message_kernels(abstract=False)], dtype=np.float32)
+            _kernel = np.concatenate([_kernel for _ in range(n_in_)], axis=0).transpose((2, 3, 0, 1))
+
+            p_kernel = tf.constant(kernel_, dtype=tf.float32, name='p_kernel')
+            z_out = tf.nn.conv2d(img_op * 100.0, p_kernel, (1, 1, 1, 1), padding='SAME')
+            t_kernel = tf.constant(_kernel, dtype=tf.float32, name='t_kernel')
+            q_i_out = tf.nn.conv2d(Q_i, t_kernel, (1, 1, 1, 1), padding='SAME', name='q_i_out')
+            q_j_out = tf.nn.conv2d(Q_j, t_kernel, (1, 1, 1, 1), padding='SAME', name='q_j_out')
+            message_i = tf.exp(-tf.square(z_out)) * q_j_out
+            message_j = tf.exp(-tf.square(z_out)) * q_i_out
+
+            # inference for both Q_i and Q_j
+            appearance_i = tf.reduce_sum(message_i, axis=3, keepdims=True, name='appearance_i')
+            appearance_j = tf.reduce_sum(message_j, axis=3, keepdims=True, name='appearance_j')
+            smooth_i = const_conv2d(Q_j, ink=gaussian_5x5, n_out=1, name='smooth_i') * Q_i
+            smooth_j = const_conv2d(Q_i, ink=gaussian_5x5, n_out=1, name='smooth_j') * Q_j
+
+            # non-parametric is also implement here for the convenience of testing
+            if has_variables:
+                probs = tf.concat([Q_j, Q_i], axis=3, name='probs')
+                concat = tf.concat([appearance_i, smooth_i, appearance_j, smooth_j], axis=3, name='concat')
+                k_out = tf.get_variable('kernel_i', shape=(1, 1, 4, 2), dtype=tf.float32,
+                                        initializer=tf.constant_initializer(1.0))
+                output = tf.log(probs + 1e-10) - tf.nn.conv2d(concat, k_out, (1, 1, 1, 1), padding='SAME')
+            else:
+                psi_i = tf.log(Q_i + 1e-10) - 5.0 * appearance_i - 1.0 * smooth_i
+                psi_j = tf.log(Q_j + 1e-10) - 5.0 * appearance_j - 1.0 * smooth_j
+                output = tf.concat([psi_j, psi_i], axis=3, name='concat')
+            return tf.nn.softmax(output, axis=3, name='softmax')
 
     def _loss_function(self, weight=0.001):
         logit_vector = tf.reshape(self.fcnn_logits, shape=(self.batch_size * self.input_dim, 2))
@@ -158,6 +191,9 @@ class CRF_RNN(object):
         return self.sess.run([self.sub_fcnn, self.sub_label], feed_dict={self.input_image_vector: imgvec,
                                                                          self.label_vector: label_vec[0, :]})
 
+    def predict_n_inference(self, imgvec):
+        return self.sess.run(self.crf, feed_dict={self.input_image_vector: imgvec})
+
     def save(self):
         if not os.path.exists(self.model_dir):
             os.makedirs(self.model_dir)
@@ -184,46 +220,54 @@ class CRF_RNN(object):
 
 
 if __name__ == '__main__':
-    reader = queueReader()
-    crf_rnn = CRF_RNN(input_shape=[512,512,1], batch_size=1,
+    import pydensecrf as dcrf
+    import matplotlib.pyplot as plt
+    from scipy.ndimage import filters
+
+    reader = queueReader(x_path='E:\\C++\\Projects\\surgeryGuidingProject_copy\\raw_data\\3\\3\\',
+                         y_path='E:\\C++\\Projects\\TrainingData\\TrainingData\\')
+    crf_rnn = CRF_RNN(input_shape=[512, 512, 1], batch_size=1,
                       input_dim=262144, learning_rate=8e-4, pre_train=True)
     show_all_variables()
-    # print('----------------------TRAINING----------------------')
-    # crf_rnn.train(reader, loop=8000)
+    print('----------------------TRAINING----------------------')
+    crf_rnn.train(reader, loop=12000)
     print('----------------------TESTING-----------------------')
 
-    iter = 230
+    iter = 20
     acc_without_crf = 0.0
     acc_with_crf = 0.0
     for _ in range(iter):
         xs, ys = reader.next_batch(1)
+        xs_uint_rgb = np.concatenate([xs.reshape((1, 512, 512, 1)) for _ in range(3)], axis=3).astype(np.uint8)
 
         pred = crf_rnn.predict(xs)
-        infe, sub_label = crf_rnn.predict_n_test(xs, ys)
+        pred_blur = filters.gaussian_filter(pred, sigma=10.0)
+        infe = dense_crf(pred, xs_uint_rgb)
+
         pred = np.argmax(pred, axis=3).reshape((1, 512**2))
         infe = np.argmax(infe, axis=3).reshape((1, 512**2))
 
         tmp_without_crf = get_accuracy(pred, ys)
-        tmp_with_crf = get_accuracy(infe, sub_label.reshape((1, 512**2))[0, :])
+        tmp_with_crf = get_accuracy(infe, ys.reshape((1, 512**2)))
         print('--IoU Precision without CRF: %g --IoU Precision with CRF: %g' % (tmp_without_crf, tmp_with_crf))
         acc_with_crf += tmp_with_crf
         acc_without_crf += tmp_without_crf
 
-        # plt.figure()
-        # plt.subplot(221)
-        # plt.imshow(pred.reshape((512, 512)), cmap='gray')
-        # plt.title('without CRF')
-        # plt.subplot(222)
-        # plt.imshow(infe.reshape((512, 512)), cmap='gray')
-        # plt.title('with CRF')
-        # plt.subplot(223)
-        # plt.imshow(xs.reshape((512, 512)), cmap='gray')
-        # plt.title('origin')
-        # plt.subplot(224)
-        # plt.imshow(ys.reshape((512, 512)), cmap='gray')
-        # plt.title('Ground Truth')
-        # plt.show()
-        # plt.close()
+        plt.figure()
+        plt.subplot(221)
+        plt.imshow(pred.reshape((512, 512)), cmap='gray')
+        plt.title('without CRF')
+        plt.subplot(222)
+        plt.imshow(infe.reshape((512, 512)), cmap='gray')
+        plt.title('with CRF')
+        plt.subplot(223)
+        plt.imshow(xs.reshape((512, 512)), cmap='gray')
+        plt.title('origin')
+        plt.subplot(224)
+        plt.imshow(ys.reshape((512, 512)), cmap='gray')
+        plt.title('Ground Truth')
+        plt.show()
+        plt.close()
 
     print('\nTotal Precision:\n\t--Precision without CRF: %g\n\t--Precision with CRF: %g' %
           (acc_without_crf / float(iter), acc_with_crf / float(iter)))
